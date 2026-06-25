@@ -8,6 +8,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [Unreleased]
+
+## [0.10.3] — 2026-06-25
+
+Patch release: blob and index formats are unchanged (`RELEASE_MINOR` stays 10), so no
+`.basemind/` rebuild. Three Windows-only correctness fixes surfaced once the comms suite and the
+full tool sweep run on the `windows-latest` CI leg, plus install/release hardening so a partial
+publish can no longer leave the plugin launcher unable to install.
+
+### Fixed
+
+- **Windows full scan now produces `/`-separated index keys** — the full-scan walker was optimized
+  to feed `Path::to_str()` straight into the index without the `\`→`/` normalization the incremental
+  `scan_paths` path still did, so on Windows every nested file was keyed with backslashes
+  (`vendored\inner.rs`) and forward-slash lookups missed — breaking all subdirectory queries
+  (outline / search / references for any file not at the repo root). Normalize at the walker source;
+  the extra allocation is Windows-only and never touches the Unix hot path.
+- **Windows comms named pipe now isolates by `comms_dir`** — `comms_socket_path` derived the
+  Windows pipe name from the username only (`\\.\pipe\basemind-comms-<user>`), ignoring
+  `BASEMIND_COMMS_DIR`, so every comms dir on a host collapsed onto one per-user singleton pipe.
+  Parallel comms suites (each isolated to its own tempdir) collided — daemons cross-contaminated,
+  one test's teardown killed another's daemon, and concurrent `comms start` races hung to the CI
+  timeout. The pipe name now mixes in a hash of `comms_dir`, mirroring the per-dir Unix socket;
+  production (which leaves `BASEMIND_COMMS_DIR` unset) keeps a single stable per-user broker. A
+  `timeout-minutes: 30` backstop on the CI test job prevents any future hang from blocking the
+  queue-not-cancel main concurrency.
+- **Windows `comms start` no longer hangs** — the detached broker daemon inherited the launcher's
+  stdout/stderr: on Windows `CreateProcess` runs with `bInheritHandles = TRUE` whenever stdio is
+  redirected, leaking every inheritable handle into the child — including the pipe a parent captured
+  via `Command::output()` (or `serve`'s MCP stdio). The long-lived daemon then held the write end
+  open, so the capturing parent never saw EOF and blocked until the daemon died. Unix is immune
+  (`Stdio::null` dup2's `/dev/null` over the child fds and Rust sets `CLOEXEC` on its own pipes).
+  `spawn_detached_daemon` now clears `HANDLE_FLAG_INHERIT` on its std handles before the detached
+  spawn, so the daemon inherits none of them; the real-daemon comms E2E suite runs on Windows again.
+- **Plugin launcher names an incomplete release instead of failing opaquely** — when a pinned
+  release is missing a platform binary or its checksums file (a partial publish, as 0.10.0 was),
+  `mcp-launch.sh` died with a bare "download failed" / "could not fetch checksums" that the MCP
+  client surfaced only as "failed to connect". It now reports the release as incomplete and tells
+  the user to update the plugin (Claude Code: `/plugin update`) to a complete release.
+- **Releases publish atomically** — `create_release` made the GitHub release live before its
+  binaries finished uploading, so a failed platform build (as 0.10.0's Linux legs) left it
+  half-populated with no checksums, and the launcher's checksum-verified download then fails closed
+  for every user pinned to it. The release is now created as a **draft**; a `finalize_release` job
+  promotes it only once all four platform archives **and** the checksums file are present (and the
+  npm / PyPI / Homebrew publishes gate on that finalize, since they download from the release). A
+  failed platform build now leaves a hidden draft, never a live, broken release.
+
+## [0.10.2] — 2026-06-25
+
+Patch release: blob and index formats are unchanged (`RELEASE_MINOR` stays 10), so no
+`.basemind/` rebuild. Fixes the Linux release archive, which 0.10.1 shipped broken on a clean host.
+
+### Fixed
+
+- **Linux release binaries: bundled libraries could not find their siblings** — the archive
+  bundles native `.so`s (libheif, libaom, …) into `lib/`, but only the main binary carried the
+  `$ORIGIN/lib` rpath. A bundled lib with a sibling dependency (`libheif.so.1` → `libaom.so.3`,
+  both in `lib/`) had no rpath of its own, so on a clean host the loader failed with
+  `libaom.so.3: cannot open shared object file` — even on `basemind --version`. The in-container
+  packaging smoke missed it because the build container has those codecs system-installed.
+  `package-release.sh` now sets `$ORIGIN` on every bundled lib so sibling-to-sibling deps resolve,
+  verified by running the real release artifact on a clean glibc-2.28 host.
+
 ## [0.10.1] — 2026-06-25
 
 Patch release: blob and index formats are unchanged (`RELEASE_MINOR` stays 10), so no
