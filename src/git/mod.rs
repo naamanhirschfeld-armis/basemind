@@ -830,10 +830,59 @@ fn change_severity(k: ChangeKind) -> u8 {
 /// `symbol_history`) stops at a rename. Deliberate asymmetry with [`Repo::blame_file`], which
 /// passes `Rewrites::default()` to gix and follows renames line-by-line.
 fn commit_touches_path(local: &gix::Repository, commit_id: gix::ObjectId, rel: &[u8]) -> bool {
-    let Some(files) = commit_files(local, commit_id) else {
+    // Path-scoped TREESAME check: compare the entry at `rel` in this commit's tree against
+    // each parent's, by (blob oid, mode). `lookup_entry` walks the path component-by-component
+    // and never recurses into sibling subtrees, so this is O(path depth) tree object reads per
+    // commit instead of the full recursive tree diff `commit_files` performs. That difference is
+    // what keeps `log_for_path` / `commits_touching` sub-second on a deep monorepo (200k+
+    // commits) — a full diff per walked commit pushes a single query into minutes.
+    //
+    // Semantics match `commit_files`' union-across-parents: the path is "touched" when it
+    // differs from at least one parent (covers add / modify / delete / mode-change). Exact-path
+    // only — like the diff path, it does not follow renames.
+    let components: Vec<&[u8]> = rel
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    if components.is_empty() {
+        return false;
+    }
+    let Ok(commit) = local.find_commit(commit_id) else {
         return false;
     };
-    files.iter().any(|(p, _)| p.as_bytes() == rel)
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let current = entry_ident_at(&tree, &components);
+
+    let parents: Vec<gix::ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+    if parents.is_empty() {
+        // Root commit — every entry is "added", so the path is touched iff it exists.
+        return current.is_some();
+    }
+    parents.into_iter().any(|pid| {
+        let parent = local
+            .find_commit(pid)
+            .ok()
+            .and_then(|pc| pc.tree().ok())
+            .and_then(|pt| entry_ident_at(&pt, &components));
+        current != parent
+    })
+}
+
+/// `(blob oid, mode)` of the entry at the given path components in `tree`, or `None` when the
+/// path is absent. `lookup_entry` follows the path component-by-component without recursing into
+/// sibling subtrees, so this is O(path depth) tree reads — not a full tree diff. The mode is part
+/// of the identity so a pure mode flip still registers as a change, matching a real diff.
+fn entry_ident_at(
+    tree: &gix::Tree<'_>,
+    components: &[&[u8]],
+) -> Option<(gix::ObjectId, gix::object::tree::EntryMode)> {
+    let entry = tree
+        .lookup_entry(components.iter().copied())
+        .ok()
+        .flatten()?;
+    Some((entry.object_id(), entry.mode()))
 }
 
 /// Line-diff between two byte buffers using the histogram algorithm + slider heuristics.
