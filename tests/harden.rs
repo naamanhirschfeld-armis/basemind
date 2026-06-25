@@ -678,6 +678,18 @@ fn assert_passing(
                     "django canary: find_references(\"get\") returned {hits} hits (expected ≥ 50)"
                 ));
             }
+            // git-history canary: `django/db/models/query.py` has been edited across many releases.
+            // ≥ 10 commits is a conservative, churn-stable lower bound (it has hundreds in reality).
+            let query_commits = repo_record
+                .canaries
+                .get("query_py_commits")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if query_commits < 10 {
+                failures.push(format!(
+                    "django canary: commits_touching(\"django/db/models/query.py\") returned {query_commits} commits (expected ≥ 10)"
+                ));
+            }
             // Governance canary — enforced only when mining actually ran (the `proposals_mined`
             // value is present, i.e. the harness was built with `--features memory`). Django
             // yields several co-change candidates at the default thresholds; ≥ 1 is a
@@ -835,6 +847,27 @@ async fn capture_canaries(svc: &ServiceHandle, repo_name: &str, record: &mut Rep
                     .map(|a| a.len() as u64)
                     .unwrap_or(0);
                 record.canaries.insert("get_hits".into(), json!(hits));
+            }
+            // git-history canary: `django/db/models/query.py` is a foundational, long-lived file
+            // touched by many commits. Served by the precomputed git-history index when the serve's
+            // background sync has caught up, else by the live walk — both must agree, so a stable
+            // lower bound holds regardless. Validates the history index end-to-end on a deep repo.
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "commits_touching",
+                    &json!({ "path": "django/db/models/query.py", "limit": 100 }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
+                let hits = body
+                    .get("commits")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record
+                    .canaries
+                    .insert("query_py_commits".into(), json!(hits));
             }
             // Governance canary — only populated under `--features memory`; with the feature
             // off, `proposals_mine` returns an MCP error and the canary stays absent (so the
